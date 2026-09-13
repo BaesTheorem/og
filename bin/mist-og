@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""mist-og: host an image behind an Open Graph page so it embeds as a link card.
+
+Facebook comment boxes that block photo attachments still render a link
+preview, and that preview's picture comes from the page's og:image. So we
+publish one tiny HTML page per image on GitHub Pages and paste that page's URL.
+
+Card image filenames carry a content hash, so re-adding a changed image gets a
+new image URL and Facebook cannot serve a stale cached picture.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+from PIL import Image, ImageEnhance, ImageFilter
+
+REPO = Path(__file__).resolve().parent.parent
+BASE = "https://baestheorem.github.io/og"
+CARD_W, CARD_H = 1200, 630
+FB_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+MANIFEST = REPO / "manifest.json"
+
+PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<meta property="og:type" content="website">
+<meta property="og:url" content="{page_url}">
+<meta property="og:title" content="{title}">
+{desc_tag}<meta property="og:image" content="{card_url}">
+<meta property="og:image:secure_url" content="{card_url}">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:width" content="{w}">
+<meta property="og:image:height" content="{h}">
+<meta property="og:image:alt" content="{alt}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:image" content="{card_url}">
+<style>
+:root {{ color-scheme: light dark; }}
+* {{ border-radius: 0; box-sizing: border-box; }}
+body {{ margin: 0; padding: 24px; background: #faf9f7; color: #1b1b1b;
+  font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }}
+main {{ max-width: 1200px; margin: 0 auto; border: 1px solid #d8d4cf; background: #fff; }}
+img {{ display: block; width: 100%; height: auto; border-bottom: 1px solid #d8d4cf; }}
+.meta {{ padding: 16px 20px; }}
+h1 {{ margin: 0 0 6px; font-size: 18px; font-weight: 600; }}
+p {{ margin: 0; color: #5d5a55; }}
+a {{ color: #1b1b1b; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #121212; color: #e8e6e3; }}
+  main {{ background: #1c1c1c; border-color: #3a3a3a; }}
+  img {{ border-bottom-color: #3a3a3a; }}
+  p {{ color: #a8a5a0; }}
+  a {{ color: #e8e6e3; }}
+}}
+</style>
+</head>
+<body>
+<main>
+<img src="{full_file}" alt="{alt}">
+<div class="meta">
+<h1>{title}</h1>
+{desc_html}<p><a href="{card_file}">card image</a></p>
+</div>
+</main>
+</body>
+</html>
+"""
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    out = subprocess.run(
+        args, cwd=cwd or REPO, capture_output=True, text=True, check=True
+    )
+    return out.stdout.strip()
+
+
+def slugify(text: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", s)[:48] or "image"
+
+
+def load_manifest() -> dict[str, dict[str, str]]:
+    if MANIFEST.exists():
+        return json.loads(MANIFEST.read_text())
+    return {}
+
+
+def save_manifest(data: dict[str, dict[str, str]]) -> None:
+    MANIFEST.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def build_card(src: Path, dest: Path, bg: str) -> None:
+    """Fit the image onto a 1200x630 canvas. Contain, never crop."""
+    with Image.open(src) as im:
+        if getattr(im, "is_animated", False):
+            im.seek(0)
+        frame = im.convert("RGBA")
+
+    if bg == "blur":
+        cover = frame.copy()
+        scale = max(CARD_W / cover.width, CARD_H / cover.height)
+        cover = cover.resize(
+            (max(1, round(cover.width * scale)), max(1, round(cover.height * scale))),
+            Image.LANCZOS,
+        )
+        left = (cover.width - CARD_W) // 2
+        top = (cover.height - CARD_H) // 2
+        canvas = cover.crop((left, top, left + CARD_W, top + CARD_H)).convert("RGB")
+        canvas = canvas.filter(ImageFilter.GaussianBlur(28))
+        canvas = ImageEnhance.Brightness(canvas).enhance(0.82)
+    else:
+        canvas = Image.new("RGB", (CARD_W, CARD_H), "#ffffff" if bg == "white" else "#000000")
+
+    fit = frame.copy()
+    scale = min(CARD_W / fit.width, CARD_H / fit.height)
+    fit = fit.resize(
+        (max(1, round(fit.width * scale)), max(1, round(fit.height * scale))),
+        Image.LANCZOS,
+    )
+    canvas.paste(fit, ((CARD_W - fit.width) // 2, (CARD_H - fit.height) // 2), fit)
+    canvas.save(dest, "JPEG", quality=88, optimize=True, progressive=True)
+
+
+def fetch(url: str, method: str = "GET") -> tuple[int, dict[str, str], bytes]:
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": FB_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, dict(resp.headers), resp.read() if method == "GET" else b""
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers or {}), b""
+    except (urllib.error.URLError, TimeoutError):
+        return 0, {}, b""
+
+
+def wait_for_pages(url: str, timeout: int = 240) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, _, _ = fetch(url, "HEAD")
+        if status == 200:
+            return True
+        time.sleep(5)
+        print(".", end="", flush=True)
+    return False
+
+
+def verify(slug: str) -> bool:
+    page_url = f"{BASE}/i/{slug}/"
+    status, _, body = fetch(page_url)
+    if status != 200:
+        print(f"FAIL page {page_url} -> HTTP {status}")
+        return False
+    text = body.decode("utf-8", "replace")
+    match = re.search(r'<meta property="og:image" content="([^"]+)"', text)
+    if not match:
+        print("FAIL page served no og:image")
+        return False
+    card_url = match.group(1)
+    istatus, headers, _ = fetch(card_url, "HEAD")
+    ctype = headers.get("Content-Type", "")
+    size = int(headers.get("Content-Length") or 0)
+    ok = istatus == 200 and ctype.startswith("image/") and 0 < size < 8_000_000
+    print(f"{'OK  ' if ok else 'FAIL'} page 200, og:image {istatus} {ctype} {size / 1024:.0f}KB")
+    print(f"     {page_url}")
+    return ok
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    src = Path(args.image).expanduser().resolve()
+    if not src.exists():
+        print(f"no such file: {src}")
+        return 1
+
+    title = args.title or src.stem.replace("_", " ").replace("-", " ")
+    slug = slugify(args.slug or title)
+    manifest = load_manifest()
+    if slug in manifest and not args.replace:
+        print(f"slug '{slug}' already exists, pass --replace or --slug")
+        return 1
+
+    digest = hashlib.sha256(src.read_bytes()).hexdigest()[:8]
+    dest_dir = REPO / "i" / slug
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for stale in dest_dir.glob("*"):
+        stale.unlink()
+
+    full_file = f"full-{digest}{src.suffix.lower()}"
+    card_file = f"card-{digest}.jpg"
+    shutil.copy2(src, dest_dir / full_file)
+    build_card(src, dest_dir / card_file, args.bg)
+
+    page_url = f"{BASE}/i/{slug}/"
+    card_url = f"{page_url}{card_file}"
+    esc_title = html.escape(title, quote=True)
+    esc_desc = html.escape(args.desc or "", quote=True)
+    (dest_dir / "index.html").write_text(
+        PAGE.format(
+            title=esc_title,
+            desc_tag=(f'<meta property="og:description" content="{esc_desc}">\n' if esc_desc else ""),
+            desc_html=(f"<p>{esc_desc}</p>\n" if esc_desc else ""),
+            alt=html.escape(args.alt or title, quote=True),
+            page_url=page_url,
+            card_url=card_url,
+            card_file=card_file,
+            full_file=full_file,
+            w=CARD_W,
+            h=CARD_H,
+        )
+    )
+
+    manifest[slug] = {
+        "title": title,
+        "description": args.desc or "",
+        "page": page_url,
+        "image": card_url,
+        "source": src.name,
+        "added": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    save_manifest(manifest)
+
+    if args.no_push:
+        print(f"staged locally: {dest_dir}")
+        return 0
+
+    run("git", "add", "-A")
+    run("git", "commit", "-m", f"add card: {slug}")
+    run("git", "push", "-q", "origin", "HEAD")
+    print(f"pushed {slug}, waiting for Pages", end="", flush=True)
+    live = wait_for_pages(card_url)
+    print()
+    if not live:
+        print("Pages did not serve the card within the timeout, re-run: mist-og verify " + slug)
+        return 1
+    verify(slug)
+    print(f"\npaste this:   {page_url}")
+    print(f"warm cache:   https://developers.facebook.com/tools/debug/?q={page_url}")
+    return 0
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    manifest = load_manifest()
+    if not manifest:
+        print("no cards yet")
+        return 0
+    for slug, meta in sorted(manifest.items(), key=lambda kv: kv[1]["added"], reverse=True):
+        print(f"{meta['added']}  {slug:32} {meta['title'][:40]}")
+        print(f"{'':21}  {meta['page']}")
+    return 0
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    manifest = load_manifest()
+    if args.slug not in manifest:
+        print(f"unknown slug: {args.slug}")
+        return 1
+    shutil.rmtree(REPO / "i" / args.slug, ignore_errors=True)
+    del manifest[args.slug]
+    save_manifest(manifest)
+    run("git", "add", "-A")
+    run("git", "commit", "-m", f"remove card: {args.slug}")
+    run("git", "push", "-q", "origin", "HEAD")
+    print(f"removed {args.slug}")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    slugs = [args.slug] if args.slug else sorted(load_manifest())
+    results = [verify(s) for s in slugs]  # verify every slug, do not short-circuit
+    return 0 if all(results) else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="mist-og", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    add = sub.add_parser("add", help="publish an image as an OG card page")
+    add.add_argument("image")
+    add.add_argument("--title", help="headline shown under the card image")
+    add.add_argument("--desc", help="grey line under the headline")
+    add.add_argument("--alt", help="alt text (defaults to the title)")
+    add.add_argument("--slug", help="URL slug (defaults to the title)")
+    add.add_argument("--bg", choices=("blur", "white", "black"), default="blur")
+    add.add_argument("--replace", action="store_true", help="overwrite an existing slug")
+    add.add_argument("--no-push", action="store_true", help="build locally, do not publish")
+    add.set_defaults(func=cmd_add)
+
+    lst = sub.add_parser("list", help="list published cards")
+    lst.set_defaults(func=cmd_list)
+
+    rm = sub.add_parser("rm", help="unpublish a card")
+    rm.add_argument("slug")
+    rm.set_defaults(func=cmd_rm)
+
+    ver = sub.add_parser("verify", help="re-check that a card is live and crawlable")
+    ver.add_argument("slug", nargs="?")
+    ver.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
